@@ -1,0 +1,251 @@
+# Lima node template for a multi-node kubeadm cluster on socket_vmnet.
+#
+# Derived from upstream templates/k8s.yaml. The substantive difference is that
+# upstream assumes `lima:user-v2` for multi-node, where every VM gets a distinct
+# address on the default route. Here we use `lima: shared` (socket_vmnet) so the
+# host can also reach node IPs and LoadBalancer VIPs. That means eth0 is
+# 192.168.5.15 in EVERY VM, so the API server, the kubelet and flannel must all
+# be pinned to the lima0 interface explicitly.
+#
+# Driven by cluster.sh, not started directly.
+
+minimumLimaVersion: 2.0.0
+
+base: template:_images/ubuntu-lts
+
+vmType: "vz"
+
+cpus: 2
+memory: "4GiB"
+disk: "30GiB"
+
+## Mounts stay off. Writable virtiofs mounts have chmod quirks under vz and
+## nothing here needs the host filesystem.
+#
+mounts: []
+
+containerd:
+  system: true
+  user: false
+
+networks:
+- lima: shared
+  interface: "lima0"
+
+provision:
+
+## Prerequisites, kubeadm/kubelet/kubectl from pkgs.k8s.io.
+#
+- mode: system
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    command -v kubeadm >/dev/null 2>&1 && exit 0
+    cat <<EOF >/etc/modules-load.d/containerd.conf
+    overlay
+    br_netfilter
+    EOF
+    modprobe overlay
+    modprobe br_netfilter
+    cat <<EOF >/etc/sysctl.d/99-kubernetes-cri.conf
+    net.bridge.bridge-nf-call-iptables  = 1
+    net.ipv4.ip_forward                 = 1
+    net.bridge.bridge-nf-call-ip6tables = 1
+    EOF
+    sysctl --system
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-upgrade ca-certificates curl gnupg
+    RELEASE="{{.Param.release}}"
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL "https://pkgs.k8s.io/core:/stable:/${RELEASE}/deb/Release.key" \
+      | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${RELEASE}/deb/ /" \
+      >/etc/apt/sources.list.d/kubernetes.list
+    apt-get update
+    apt-get install -y kubelet kubeadm kubectl
+    apt-mark hold kubelet kubeadm kubectl
+    systemctl enable --now kubelet
+
+## containerd CRI config: systemd cgroups and the matching pause image.
+#
+- mode: system
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    [ -e /etc/containerd/conf.d/k8s.toml ] && exit 0
+    mkdir -p /etc/containerd/conf.d
+    cat <<EOF >/etc/containerd/conf.d/k8s.toml
+    version = 2
+    [plugins]
+      [plugins."io.containerd.grpc.v1.cri"]
+        sandbox_image = "$(kubeadm config images list | grep pause | sort -r | head -n1)"
+        [plugins."io.containerd.grpc.v1.cri".containerd]
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+              runtime_type = "io.containerd.runc.v2"
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                SystemdCgroup = true
+      [plugins."io.containerd.cri.v1.runtime".cni]
+        bin_dirs = ["/usr/local/libexec/cni","/opt/cni/bin"]
+    EOF
+    systemctl restart containerd
+
+## kubeadm init or join, both pinned to lima0.
+#
+- mode: system
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    test -e /etc/kubernetes/kubelet.conf && exit 0
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    IFACE="{{.Param.nodeInterface}}"
+
+    ## socket_vmnet DHCP can lag the first provision script, so wait for it.
+    #
+    NODE_IP=""
+    for _ in $(seq 1 60)
+    do
+      NODE_IP=$(ip -4 -o addr show "${IFACE}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+      if [ -n "${NODE_IP}" ]
+      then
+        break
+      fi
+      sleep 2
+    done
+    if [ -z "${NODE_IP}" ]
+    then
+      echo >&2 "no IPv4 address on ${IFACE}; is socket_vmnet running?"
+      exit 1
+    fi
+    echo "${NODE_IP}" >/etc/lima-node-ip
+
+    {{if not ( and .Param.url .Param.token )}}
+    systemctl stop kubelet
+    kubeadm config images pull --cri-socket=unix:///run/containerd/containerd.sock
+    systemctl start kubelet
+    cat <<EOF >/etc/kubeadm-config.yaml
+    kind: InitConfiguration
+    apiVersion: kubeadm.k8s.io/v1beta4
+    localAPIEndpoint:
+      advertiseAddress: "${NODE_IP}"
+      bindPort: 6443
+    nodeRegistration:
+      criSocket: unix:///run/containerd/containerd.sock
+      kubeletExtraArgs:
+      - name: node-ip
+        value: "${NODE_IP}"
+    ---
+    kind: ClusterConfiguration
+    apiVersion: kubeadm.k8s.io/v1beta4
+    apiServer:
+      certSANs:
+      - "127.0.0.1"
+      - "${NODE_IP}"
+    networking:
+      podSubnet: "{{.Param.podSubnet}}"
+      serviceSubnet: "{{.Param.serviceSubnet}}"
+    ---
+    kind: KubeletConfiguration
+    apiVersion: kubelet.config.k8s.io/v1beta1
+    cgroupDriver: systemd
+    EOF
+    kubeadm init --config /etc/kubeadm-config.yaml
+
+    ## Flannel picks the default-route interface unless told otherwise, which
+    ## here is the useless 192.168.5.15 shared by all three nodes.
+    #
+    curl -fsSL "https://github.com/flannel-io/flannel/releases/download/{{.Param.flannelVersion}}/kube-flannel.yml" \
+      -o /tmp/kube-flannel.yml
+    sed -i "s|- --kube-subnet-mgr|- --kube-subnet-mgr\n        - --iface=${IFACE}|" /tmp/kube-flannel.yml
+    kubectl apply -f /tmp/kube-flannel.yml
+
+    mkdir -p /root/.kube && ln -sf "${KUBECONFIG}" /root/.kube/config
+
+    ## Host-facing kubeconfig points at the routable lima0 address rather than a
+    ## forwarded localhost port, so it survives port-forward hiccups.
+    #
+    sed -e "/server:/ s|https://.*:\([0-9]*\)$|https://${NODE_IP}:\1|" \
+      "${KUBECONFIG}" >/root/.kube/config.host
+    {{else}}
+    cat <<EOF >/etc/kubeadm-config.yaml
+    kind: JoinConfiguration
+    apiVersion: kubeadm.k8s.io/v1beta4
+    nodeRegistration:
+      criSocket: unix:///run/containerd/containerd.sock
+      kubeletExtraArgs:
+      - name: node-ip
+        value: "${NODE_IP}"
+    discovery:
+      bootstrapToken:
+        apiServerEndpoint: "{{.Param.url}}"
+        token: "{{.Param.token}}"
+        caCertHashes:
+        - "{{.Param.discoveryTokenCaCertHash}}"
+    EOF
+    kubeadm join --config /etc/kubeadm-config.yaml
+    {{end}}
+
+## Give the lima user a working kubectl on the control plane.
+#
+- mode: system
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    {{if not ( and .Param.url .Param.token )}}
+    mkdir -p {{.Home}}/.kube
+    cp -f /etc/kubernetes/admin.conf {{.Home}}/.kube/config
+    chown -R {{.User}} {{.Home}}/.kube
+    {{end}}
+
+probes:
+- description: "kubeadm to be installed"
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    if ! timeout 300s bash -c "until command -v kubeadm >/dev/null 2>&1; do sleep 3; done"
+    then
+      echo >&2 "kubeadm is not installed yet"
+      exit 1
+    fi
+  hint: |
+    See "/var/log/cloud-init-output.log" in the guest.
+
+- description: "node to have joined the cluster"
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    if ! timeout 600s bash -c "until test -f /etc/kubernetes/kubelet.conf; do sleep 3; done"
+    then
+      echo >&2 "kubelet.conf never appeared; kubeadm did not complete"
+      exit 1
+    fi
+  hint: |
+    Check "sudo journalctl -u kubelet" and /var/log/cloud-init-output.log.
+
+- description: "coredns to be available"
+  script: |
+    #!/usr/bin/env bash
+    set -eux -o pipefail
+    {{if not ( and .Param.url .Param.token )}}
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf wait -n kube-system \
+      --timeout=300s --for=condition=available deploy coredns
+    {{end}}
+
+copyToHost:
+- guest: "/root/.kube/config.host"
+  host: "{{.Dir}}/copied-from-guest/kubeconfig.yaml"
+  skipIfMissing: true
+  deleteOnStop: true
+
+param:
+  ## Package repo branch, e.g. "v1.34". Not the same as the patch version.
+  #
+  release: "v1.34"
+  nodeInterface: "lima0"
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+  flannelVersion: "v0.28.9"
+  url: ""
+  token: ""
+  discoveryTokenCaCertHash: ""
