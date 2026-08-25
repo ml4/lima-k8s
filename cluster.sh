@@ -13,6 +13,12 @@
 
 set -euo pipefail
 
+## socket_vmnet runs under sudo but inherits the caller's umask. With a
+## restrictive umask (077) its pid file and socket land 0600 root:wheel and
+## limactl, running as you, cannot read them back.
+#
+umask 022
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="${SCRIPT_DIR}/k8s-node.yaml"
 
@@ -47,7 +53,14 @@ die() {
 }
 
 instance_exists() {
-  limactl list --format '{{.Name}}' 2>/dev/null | grep -qx "${1}"
+  ## A failed create leaves the instance directory behind while `limactl list`
+  ## may not report it, so check both.
+  #
+  if limactl list --format '{{.Name}}' 2>/dev/null | grep -qx "${1}"
+  then
+    return 0
+  fi
+  [ -d "${LIMA_HOME:-${HOME}/.lima}/${1}" ]
 }
 
 cp_dir() {
@@ -87,6 +100,18 @@ preflight() {
   then
     warn "dhcpEnd is still .254 in ${NETWORKS_YAML}"
     warn "set it to ${DHCP_END} before using ./cluster.sh metallb"
+  fi
+
+  ## Leftover 0600 root-owned pid/socket files from a run under a restrictive
+  ## umask will fail every subsequent start until they are cleared.
+  #
+  if [ -d /private/var/run/lima ]
+  then
+    if find /private/var/run/lima -maxdepth 1 -type f ! -perm -044 2>/dev/null | grep -q .
+    then
+      warn "unreadable files in /private/var/run/lima from an earlier run"
+      warn "run: sudo pkill -f socket_vmnet; sudo rm -rf /private/var/run/lima"
+    fi
   fi
 
   [ ! -f "${TEMPLATE}" ] && die "template not found: ${TEMPLATE}"
@@ -213,11 +238,25 @@ show_kubeconfig() {
   echo "export KUBECONFIG=\"$(cp_dir)/copied-from-guest/kubeconfig.yaml\""
 }
 
+wait_for_coredns() {
+  local kubeconfig
+  kubeconfig="$(cp_dir)/copied-from-guest/kubeconfig.yaml"
+
+  ## cp1 keeps its control-plane taint, so CoreDNS cannot schedule until at
+  ## least one worker is Ready. That is why this wait lives here and not in a
+  ## template probe.
+  #
+  log "waiting for CoreDNS"
+  kubectl --kubeconfig="${kubeconfig}" wait -n kube-system \
+    --for=condition=available --timeout=300s deploy/coredns
+}
+
 do_up() {
   preflight
   start_control_plane
   join_workers
   label_workers
+  wait_for_coredns
   echo
   log "cluster up"
   show_kubeconfig

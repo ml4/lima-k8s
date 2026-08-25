@@ -184,6 +184,12 @@ provision:
         - "{{.Param.discoveryTokenCaCertHash}}"
     EOF
     kubeadm join --config /etc/kubeadm-config.yaml
+
+    ## copyToHost applies to every instance and Lima 2.2.0 has no
+    ## skipIfMissing, so a worker with no config.host is marked DEGRADED.
+    #
+    mkdir -p /root/.kube
+    : >/root/.kube/config.host
     {{end}}
 
 ## Give the lima user a working kubectl on the control plane.
@@ -223,19 +229,31 @@ probes:
   hint: |
     Check "sudo journalctl -u kubelet" and /var/log/cloud-init-output.log.
 
-- description: "coredns to be available"
+- description: "control plane to be responsive"
   script: |
     #!/usr/bin/env bash
     set -eux -o pipefail
     {{if not ( and .Param.url .Param.token )}}
-    kubectl --kubeconfig=/etc/kubernetes/admin.conf wait -n kube-system \
-      --timeout=300s --for=condition=available deploy coredns
+    ## Probes run as the lima user. /etc/kubernetes/admin.conf is 0600 root:root,
+    ## so kubectl has to go through sudo here.
+    #
+    if ! timeout 180s bash -c "until sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw /healthz >/dev/null 2>&1; do sleep 3; done"
+    then
+      echo >&2 "API server never became healthy"
+      exit 1
+    fi
     {{end}}
+  hint: |
+    CoreDNS stays Pending until a worker joins; that wait belongs in cluster.sh,
+    not here.
 
+## Lima 2.2.0's CopyToHost has no skipIfMissing field, so this copy runs on
+## every node and fails the instance if the file is absent. Workers therefore
+## write an empty placeholder in the join branch above.
+#
 copyToHost:
 - guest: "/root/.kube/config.host"
   host: "{{.Dir}}/copied-from-guest/kubeconfig.yaml"
-  skipIfMissing: true
   deleteOnStop: true
 
 param:
