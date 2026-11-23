@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
-# cluster.sh - reproducible three-node kubeadm cluster on Lima + socket_vmnet.
+# cluster.sh - reproducible multi-cluster kubeadm labs on Lima + socket_vmnet.
 #
-#   ./cluster.sh up          build the cluster from nothing
-#   ./cluster.sh down        delete all three VMs
-#   ./cluster.sh stop        stop the VMs, keep the disks
-#   ./cluster.sh start       start previously stopped VMs
-#   ./cluster.sh status      node and pod summary
-#   ./cluster.sh check       run the cluster health checks, echoing each command
-#   ./cluster.sh kubeconfig  print the export line for your shell
-#   ./cluster.sh metallb     install MetalLB in L2 mode
-#   ./cluster.sh preflight   check the host is ready, change nothing
+# Usage: ./cluster.sh <command> [cluster]
+#
+#   ./cluster.sh up a          build cluster a
+#   ./cluster.sh up b          build cluster b alongside it
+#   ./cluster.sh check a       verification checks for cluster a
+#   ./cluster.sh list          every instance across every cluster
+#   ./cluster.sh down b        delete cluster b only
+#   ./cluster.sh nuke          delete every cluster and clear runtime state
+#
+# Cluster defaults to "a" when omitted.
 
 set -euo pipefail
 
@@ -24,20 +25,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 TEMPLATE="${SCRIPT_DIR}/k8s-node.yaml"
 
-CP_NAME="${CP_NAME:-cp1}"
-WORKER_NAMES="${WORKER_NAMES:-w1 w2}"
-CP_CPUS="${CP_CPUS:-2}"
-CP_MEMORY="${CP_MEMORY:-4}"
-WORKER_CPUS="${WORKER_CPUS:-2}"
-WORKER_MEMORY="${WORKER_MEMORY:-4}"
-
-## MetalLB pool. Must sit above dhcpEnd in ~/.lima/_config/networks.yaml,
-## otherwise socket_vmnet will hand these addresses to VMs and you get an
-## ARP fight between MetalLB and a node.
+## Every cluster this script knows about. nuke and list iterate this.
 #
-METALLB_RANGE="${METALLB_RANGE:-192.168.105.200-192.168.105.250}"
-DHCP_END="${DHCP_END:-192.168.105.199}"
+KNOWN_CLUSTERS="${KNOWN_CLUSTERS:-a b}"
 
+## Workshop defaults: two k8s clusters must coexist on a 32GiB Mac without
+## swapping. kubeadm hard-requires 2 vCPU on the control plane; workers are fine
+## on 1. Override for CKA practice: WORKER_SUFFIXES="w1 w2" WORKER_MEMORY=4
+#
+CP_SUFFIX="${CP_SUFFIX:-cp1}"
+WORKER_SUFFIXES="${WORKER_SUFFIXES:-w1}"
+CP_CPUS="${CP_CPUS:-2}"
+CP_MEMORY="${CP_MEMORY:-3}"
+WORKER_CPUS="${WORKER_CPUS:-1}"
+WORKER_MEMORY="${WORKER_MEMORY:-2}"
+
+## Warn when the host is close to swapping. VZ does not reliably hand guest
+## memory back to macOS, so pressure only ever accumulates.
+#
+MEM_FREE_WARN_PCT="${MEM_FREE_WARN_PCT:-30}"
+SWAP_USED_WARN_MB="${SWAP_USED_WARN_MB:-512}"
+
+DHCP_END="${DHCP_END:-192.168.105.199}"
 NETWORKS_YAML="${HOME}/.lima/_config/networks.yaml"
 SUDOERS_FILE="/etc/sudoers.d/lima"
 
@@ -95,9 +104,79 @@ function die {
 }
 
 ##################################################################################################################################################
+## cluster_config
+## Resolve every per-cluster value from the cluster letter. Two clusters share
+## the 192.168.105.0/24 segment, so pod subnets, VXLAN VNIs and MetalLB pools
+## must not overlap.
+#
+function cluster_config {
+  CLUSTER="${1}"
+
+  case "${CLUSTER}" in
+    a)
+      POD_SUBNET="10.244.0.0/16"
+      VNI="1"
+      METALLB_RANGE="${METALLB_RANGE_A:-192.168.105.200-192.168.105.224}"
+      ;;
+    b)
+      POD_SUBNET="10.245.0.0/16"
+      VNI="2"
+      METALLB_RANGE="${METALLB_RANGE_B:-192.168.105.225-192.168.105.249}"
+      ;;
+    *)
+      die "unknown cluster '${CLUSTER}'; known clusters: ${KNOWN_CLUSTERS}" "${FUNCNAME[0]}"
+      ;;
+  esac
+
+  SERVICE_SUBNET="10.96.0.0/12"
+  CP_NAME="${CLUSTER}-${CP_SUFFIX}"
+
+  WORKER_NAMES=""
+  for suffix in ${WORKER_SUFFIXES}
+  do
+    WORKER_NAMES="${WORKER_NAMES} ${CLUSTER}-${suffix}"
+  done
+  WORKER_NAMES="$(echo "${WORKER_NAMES}" | xargs)"
+
+  log "INFO" "${FUNCNAME[0]}" "cluster ${CLUSTER}: cp=${CP_NAME} workers=[${WORKER_NAMES}] pods=${POD_SUBNET} vni=${VNI}"
+}
+
+##################################################################################################################################################
+## check_host_memory
+## macOS reports differently to Linux: "used" includes purgeable cache, so the
+## meaningful signals are free percentage and swap consumption, not free RAM.
+#
+function check_host_memory {
+  local free_pct swap_used
+
+  free_pct="$(memory_pressure 2>/dev/null | awk -F': *' '/free percentage/ {gsub(/%/,"",$2); print $2}')"
+  swap_used="$(sysctl -n vm.swapusage 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="used") {gsub(/M/,"",$(i+2)); print $(i+2)}}')"
+
+  if [ -n "${free_pct}" ]
+  then
+    if [ "${free_pct%%.*}" -lt "${MEM_FREE_WARN_PCT}" ]
+    then
+      log "WARN" "${FUNCNAME[0]}" "host memory free ${free_pct}% (below ${MEM_FREE_WARN_PCT}%)"
+    else
+      log "INFO" "${FUNCNAME[0]}" "host memory free ${free_pct}%"
+    fi
+  fi
+
+  if [ -n "${swap_used}" ]
+  then
+    if [ "${swap_used%%.*}" -gt "${SWAP_USED_WARN_MB}" ]
+    then
+      log "WARN" "${FUNCNAME[0]}" "swap in use: ${swap_used}MB — stop unused VMs before building more"
+      log "WARN" "${FUNCNAME[0]}" "check: limactl list; limactl stop <name>"
+    else
+      log "INFO" "${FUNCNAME[0]}" "swap in use: ${swap_used}MB"
+    fi
+  fi
+}
+
+##################################################################################################################################################
 ## assert_binary
 ## fail early and loudly if a required binary is not on PATH
-## Usage: assert_binary "kubectl" "install with: brew install kubectl"
 #
 function assert_binary {
   local -r binary="${1}"
@@ -119,7 +198,7 @@ function assert_binary {
 
 ##################################################################################################################################################
 ## assert_kubeconfig
-## fail early if the control plane kubeconfig has not been copied to the host yet
+## fail early if the control plane kubeconfig has not been copied to the host
 #
 function assert_kubeconfig {
   local -r kubeconfig="${1}"
@@ -127,7 +206,7 @@ function assert_kubeconfig {
   if [ ! -s "${kubeconfig}" ]
   then
     log "ERROR" "${FUNCNAME[0]}" "kubeconfig missing or empty: ${kubeconfig}"
-    log "ERROR" "${FUNCNAME[0]}" "is ${CP_NAME} running? try: ./${SCRIPT_NAME} up"
+    log "ERROR" "${FUNCNAME[0]}" "is ${CP_NAME} running? try: ./${SCRIPT_NAME} up ${CLUSTER}"
     return 1
   fi
 
@@ -139,7 +218,6 @@ function assert_kubeconfig {
 ## run_check
 ## echo the command at CMD level so it can be re-run by hand, then run it and
 ## print the output verbatim
-## Usage: run_check "nodes and their lima0 addresses" kubectl get nodes -o wide
 #
 function run_check {
   local -r description="${1}"
@@ -169,8 +247,15 @@ function run_check {
 instance_exists() {
   ## A failed create leaves the instance directory behind while `limactl list`
   ## may not report it, so check both.
+  ##
+  ## The listing is captured before matching rather than piped into grep -q:
+  ## under `set -o pipefail`, grep exiting early on a match SIGPIPEs limactl and
+  ## the pipeline returns 141, so the function intermittently reported existing
+  ## instances as absent.
   #
-  if limactl list --format '{{.Name}}' 2>/dev/null | grep -qx "${1}"
+  local names
+  names="$(limactl list --format '{{.Name}}' 2>/dev/null || true)"
+  if grep -qx "${1}" <<< "${names}"
   then
     return 0
   fi
@@ -191,9 +276,9 @@ preflight() {
   assert_binary "limactl" "install with: brew install lima" || missing=1
   assert_binary "kubectl" "install with: brew install kubectl" || missing=1
 
-  if [ ! -x /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet ] \
-    && [ ! -x /usr/local/opt/socket_vmnet/bin/socket_vmnet ] \
-    && [ ! -x /opt/socket_vmnet/bin/socket_vmnet ]
+  if [ ! -x /opt/socket_vmnet/bin/socket_vmnet ] \
+    && [ ! -x /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet ] \
+    && [ ! -x /usr/local/opt/socket_vmnet/bin/socket_vmnet ]
   then
     log "ERROR" "${FUNCNAME[0]}" "socket_vmnet not found in any known prefix"
     log "ERROR" "${FUNCNAME[0]}" "build it: sudo make PREFIX=/opt/socket_vmnet install.bin"
@@ -228,7 +313,7 @@ preflight() {
     if find /private/var/run/lima -maxdepth 1 -type f ! -perm -044 2>/dev/null | grep -q .
     then
       log "WARN" "${FUNCNAME[0]}" "unreadable files in /private/var/run/lima from an earlier run"
-      log "WARN" "${FUNCNAME[0]}" "run: sudo pkill -f socket_vmnet; sudo rm -rf /private/var/run/lima"
+      log "WARN" "${FUNCNAME[0]}" "run: ./${SCRIPT_NAME} nuke"
     fi
   fi
 
@@ -236,6 +321,14 @@ preflight() {
   then
     die "template not found: ${TEMPLATE}" "${FUNCNAME[0]}"
   fi
+
+  ## Each k8s cluster costs CP_MEMORY + (workers x WORKER_MEMORY) GiB.
+  #
+  local running total
+  running="$(limactl list --format '{{.Name}}' 2>/dev/null | wc -l | xargs)"
+  total=$(( CP_MEMORY + $(echo "${WORKER_SUFFIXES}" | wc -w | xargs) * WORKER_MEMORY ))
+  log "INFO" "${FUNCNAME[0]}" "${running} lima instance(s) exist; cluster ${CLUSTER} will use ${total}GiB"
+  check_host_memory
 
   if [ "${missing}" -ne 0 ]
   then
@@ -252,12 +345,15 @@ start_control_plane() {
     return
   fi
 
-  log "INFO" "${FUNCNAME[0]}" "creating control plane ${CP_NAME} (${CP_CPUS} vCPU, ${CP_MEMORY}GiB)"
+  log "INFO" "${FUNCNAME[0]}" "creating control plane ${CP_NAME} (${CP_CPUS} vCPU, ${CP_MEMORY}GiB, pods ${POD_SUBNET}, vni ${VNI})"
   limactl start \
     --name="${CP_NAME}" \
     --cpus="${CP_CPUS}" \
     --memory="${CP_MEMORY}" \
     --tty=false \
+    --param podSubnet="${POD_SUBNET}" \
+    --param serviceSubnet="${SERVICE_SUBNET}" \
+    --param vni="${VNI}" \
     "${TEMPLATE}"
 }
 
@@ -298,6 +394,9 @@ join_workers() {
       --cpus="${WORKER_CPUS}" \
       --memory="${WORKER_MEMORY}" \
       --tty=false \
+      --param podSubnet="${POD_SUBNET}" \
+      --param serviceSubnet="${SERVICE_SUBNET}" \
+      --param vni="${VNI}" \
       --param url="${url}" \
       --param token="${token}" \
       --param discoveryTokenCaCertHash="${hash}" \
@@ -317,6 +416,19 @@ label_workers() {
   done
 }
 
+wait_for_coredns() {
+  local kubeconfig
+  kubeconfig="$(kubeconfig_path)"
+
+  ## The control plane keeps its taint, so CoreDNS cannot schedule until at
+  ## least one worker is Ready. That is why this wait lives here and not in a
+  ## template probe.
+  #
+  log "INFO" "${FUNCNAME[0]}" "waiting for CoreDNS to become available"
+  kubectl --kubeconfig="${kubeconfig}" wait -n kube-system \
+    --for=condition=available --timeout=300s deploy/coredns
+}
+
 install_metallb() {
   local kubeconfig version
   kubeconfig="$(kubeconfig_path)"
@@ -331,7 +443,7 @@ install_metallb() {
     die "could not determine MetalLB version; set METALLB_VERSION" "${FUNCNAME[0]}"
   fi
 
-  log "INFO" "${FUNCNAME[0]}" "installing MetalLB ${version}"
+  log "INFO" "${FUNCNAME[0]}" "installing MetalLB ${version} on cluster ${CLUSTER}"
   kubectl --kubeconfig="${kubeconfig}" apply -f \
     "https://raw.githubusercontent.com/metallb/metallb/${version}/config/manifests/metallb-native.yaml"
 
@@ -344,7 +456,7 @@ install_metallb() {
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
-  name: lima-pool
+  name: lima-pool-${CLUSTER}
   namespace: metallb-system
 spec:
   addresses:
@@ -353,19 +465,19 @@ spec:
 apiVersion: metallb.io/v1beta1
 kind: L2Advertisement
 metadata:
-  name: lima-l2
+  name: lima-l2-${CLUSTER}
   namespace: metallb-system
 spec:
   ipAddressPools:
-  - lima-pool
+  - lima-pool-${CLUSTER}
 EOF
-  log "INFO" "${FUNCNAME[0]}" "LoadBalancer services will now get VIPs your Mac can reach directly"
+  log "INFO" "${FUNCNAME[0]}" "cluster ${CLUSTER} LoadBalancer VIPs come from ${METALLB_RANGE}"
 }
 
 ##################################################################################################################################################
 ## run_checks
-## the post-build verification suite. Every command is echoed at CMD level so it
-## can be pasted straight into a shell when a check needs digging into.
+## post-build verification. Every command is echoed at CMD level so it can be
+## pasted straight into a shell when a check needs digging into.
 #
 function run_checks {
   local kubeconfig failures=0
@@ -395,6 +507,15 @@ function run_checks {
     "${kc[@]}" -n kube-flannel get daemonset kube-flannel-ds \
     -o jsonpath='{.spec.template.spec.containers[*].args}' || failures=$((failures + 1))
 
+  ## Two clusters on one L2 segment must not share a pod subnet or a VNI.
+  #
+  run_check "flannel net-conf (expect Network ${POD_SUBNET}, VNI ${VNI})" \
+    "${kc[@]}" -n kube-flannel get configmap kube-flannel-cfg \
+    -o jsonpath='{.data.net-conf\.json}' || failures=$((failures + 1))
+
+  run_check "service account issuer, the JWT auth trust anchor" \
+    "${kc[@]}" get --raw /.well-known/openid-configuration || failures=$((failures + 1))
+
   run_check "all pods across all namespaces" \
     "${kc[@]}" get pods -A -o wide || failures=$((failures + 1))
 
@@ -410,11 +531,11 @@ function run_checks {
 
   if [ "${failures}" -ne 0 ]
   then
-    log "ERROR" "${FUNCNAME[0]}" "${failures} check(s) failed"
+    log "ERROR" "${FUNCNAME[0]}" "${failures} check(s) failed on cluster ${CLUSTER}"
     return 1
   fi
 
-  log "INFO" "${FUNCNAME[0]}" "all checks passed"
+  log "INFO" "${FUNCNAME[0]}" "all checks passed on cluster ${CLUSTER}"
   return 0
 }
 
@@ -434,17 +555,36 @@ show_kubeconfig() {
   echo "export KUBECONFIG=\"$(kubeconfig_path)\""
 }
 
-wait_for_coredns() {
-  local kubeconfig
-  kubeconfig="$(kubeconfig_path)"
+##################################################################################################################################################
+## show_sapub
+## Print the control plane's service account signing public key, which is what
+## Vault's JWT auth method needs in jwt_validation_pubkeys.
+#
+function show_sapub {
+  log "INFO" "${FUNCNAME[0]}" "service account signing public key for cluster ${CLUSTER}"
+  log "CMD" "${FUNCNAME[0]}" "limactl shell ${CP_NAME} sudo cat /etc/kubernetes/pki/sa.pub"
+  limactl shell "${CP_NAME}" sudo cat /etc/kubernetes/pki/sa.pub
+}
 
-  ## cp1 keeps its control-plane taint, so CoreDNS cannot schedule until at
-  ## least one worker is Ready. That is why this wait lives here and not in a
-  ## template probe.
-  #
-  log "INFO" "${FUNCNAME[0]}" "waiting for CoreDNS to become available"
-  kubectl --kubeconfig="${kubeconfig}" wait -n kube-system \
-    --for=condition=available --timeout=300s deploy/coredns
+##################################################################################################################################################
+## list_all
+## Every instance this script knows about, across every cluster.
+#
+function list_all {
+  assert_binary "limactl" "install with: brew install lima" || exit 1
+
+  run_check "all lima instances" limactl list || true
+
+  for cluster in ${KNOWN_CLUSTERS}
+  do
+    local cp="${cluster}-${CP_SUFFIX}"
+    if instance_exists "${cp}"
+    then
+      log "INFO" "${FUNCNAME[0]}" "cluster ${cluster}: present"
+    else
+      log "INFO" "${FUNCNAME[0]}" "cluster ${cluster}: absent"
+    fi
+  done
 }
 
 do_up() {
@@ -453,8 +593,8 @@ do_up() {
   join_workers
   label_workers
   wait_for_coredns
-  log "INFO" "${FUNCNAME[0]}" "cluster up"
-  log "INFO" "${FUNCNAME[0]}" "verify with: ./${SCRIPT_NAME} check"
+  log "INFO" "${FUNCNAME[0]}" "cluster ${CLUSTER} up"
+  log "INFO" "${FUNCNAME[0]}" "verify with: ./${SCRIPT_NAME} check ${CLUSTER}"
   show_kubeconfig
 }
 
@@ -467,6 +607,7 @@ do_down() {
       limactl delete --force "${instance}"
     fi
   done
+  log "INFO" "${FUNCNAME[0]}" "cluster ${CLUSTER} deleted"
 }
 
 do_stop() {
@@ -490,35 +631,123 @@ do_start() {
   done
 }
 
-case "${1:-up}" in
+##################################################################################################################################################
+## do_nuke
+## Delete every known cluster and clear socket_vmnet runtime state. Destructive
+## and irreversible, so it asks first unless NUKE_YES=1.
+#
+function do_nuke {
+  local targets=""
+
+  for cluster in ${KNOWN_CLUSTERS}
+  do
+    for instance in "${cluster}-${CP_SUFFIX}" $(for s in ${WORKER_SUFFIXES}; do echo "${cluster}-${s}"; done)
+    do
+      if instance_exists "${instance}"
+      then
+        targets="${targets} ${instance}"
+      fi
+    done
+  done
+  targets="$(echo "${targets}" | xargs)"
+
+  if [ -z "${targets}" ]
+  then
+    log "INFO" "${FUNCNAME[0]}" "no known cluster instances to delete"
+  else
+    log "WARN" "${FUNCNAME[0]}" "about to permanently delete: ${targets}"
+  fi
+  log "WARN" "${FUNCNAME[0]}" "and clear /private/var/run/lima (needs sudo)"
+
+  ## Anything not created by this script is left alone, so say so.
+  #
+  local strays
+  local all_names
+  all_names="$(limactl list --format '{{.Name}}' 2>/dev/null || true)"
+  strays="$(grep -vE "^($(echo "${targets}" | tr ' ' '|'))$" <<< "${all_names}" || true)"
+  if [ -n "${strays}" ] && [ -n "${targets}" ]
+  then
+    log "WARN" "${FUNCNAME[0]}" "leaving other instances untouched: $(echo "${strays}" | xargs)"
+  fi
+
+  if [ "${NUKE_YES:-0}" != "1" ]
+  then
+    read -r -p "Type 'nuke' to confirm: " reply
+    if [ "${reply}" != "nuke" ]
+    then
+      die "aborted" "${FUNCNAME[0]}"
+    fi
+  fi
+
+  for instance in ${targets}
+  do
+    log "INFO" "${FUNCNAME[0]}" "deleting ${instance}"
+    limactl delete --force "${instance}" || true
+  done
+
+  log "INFO" "${FUNCNAME[0]}" "stopping socket_vmnet and clearing runtime state"
+  sudo pkill -f socket_vmnet || true
+  sudo rm -rf /private/var/run/lima
+  log "INFO" "${FUNCNAME[0]}" "done; run ./${SCRIPT_NAME} preflight before rebuilding"
+}
+
+##################################################################################################################################################
+## main
+#
+COMMAND="${1:-up}"
+CLUSTER_ARG="${2:-a}"
+
+case "${COMMAND}" in
+  list)
+    list_all
+    ;;
+  mem)
+    check_host_memory
+    ;;
+  nuke)
+    do_nuke
+    ;;
   up)
+    cluster_config "${CLUSTER_ARG}"
     do_up
     ;;
   down)
+    cluster_config "${CLUSTER_ARG}"
     do_down
     ;;
   stop)
+    cluster_config "${CLUSTER_ARG}"
     do_stop
     ;;
   start)
+    cluster_config "${CLUSTER_ARG}"
     do_start
     ;;
   status)
+    cluster_config "${CLUSTER_ARG}"
     show_status
     ;;
   check)
+    cluster_config "${CLUSTER_ARG}"
     run_checks
     ;;
   kubeconfig)
+    cluster_config "${CLUSTER_ARG}" >/dev/null 2>&1
     show_kubeconfig
     ;;
+  sapub)
+    cluster_config "${CLUSTER_ARG}" >/dev/null 2>&1
+    show_sapub
+    ;;
   metallb)
+    cluster_config "${CLUSTER_ARG}"
     install_metallb
     ;;
   preflight)
+    cluster_config "${CLUSTER_ARG}"
     preflight
     ;;
   *)
-    die "unknown command: ${1}" "main"
+    die "unknown command: ${COMMAND}" "main"
     ;;
 esac

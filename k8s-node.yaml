@@ -32,6 +32,16 @@ networks:
 - lima: shared
   interface: "lima0"
 
+## Nothing here uses forwarded ports: the kubeconfig targets the lima0 address
+## directly and SSH goes over vsock. With several VMs competing for the same
+## control-plane ports on 127.0.0.1 the warnings are pure noise, and a stray
+## localhost kubeconfig silently reaching whichever k8s cluster won the race is
+## worse than noise.
+#
+portForwards:
+- guestPortRange: [1, 65535]
+  ignore: true
+
 provision:
 
 ## Prerequisites, kubeadm/kubelet/kubectl from pkgs.k8s.io.
@@ -158,6 +168,13 @@ provision:
     curl -fsSL "https://github.com/flannel-io/flannel/releases/download/{{.Param.flannelVersion}}/kube-flannel.yml" \
       -o /tmp/kube-flannel.yml
     sed -i "s|- --kube-subnet-mgr|- --kube-subnet-mgr\n        - --iface=${IFACE}|" /tmp/kube-flannel.yml
+
+    ## Two clusters share the 192.168.105.0/24 segment, so each needs its own
+    ## pod subnet and its own VXLAN VNI or the overlays collide.
+    #
+    sed -i 's|"Network": "10.244.0.0/16"|"Network": "{{.Param.podSubnet}}"|' /tmp/kube-flannel.yml
+    sed -i 's|"Type": "vxlan"|"Type": "vxlan", "VNI": {{.Param.vni}}|' /tmp/kube-flannel.yml
+    grep -A8 'net-conf.json' /tmp/kube-flannel.yml | head -12
     kubectl apply -f /tmp/kube-flannel.yml
 
     mkdir -p /root/.kube && ln -sf "${KUBECONFIG}" /root/.kube/config
@@ -264,6 +281,7 @@ param:
   podSubnet: "10.244.0.0/16"
   serviceSubnet: "10.96.0.0/12"
   flannelVersion: "v0.28.9"
+  vni: "1"
   url: ""
   token: ""
   discoveryTokenCaCertHash: ""
